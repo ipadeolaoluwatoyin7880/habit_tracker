@@ -1,3 +1,2 @@
-from .user_interface import UserInterface
-
-__all__ = ['UserInterface']
+# src/cli/__init__.py
+# CLI package initialization

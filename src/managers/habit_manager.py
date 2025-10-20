@@ -1,110 +1,178 @@
-from typing import List, Optional
-from src.data_model.habit import BaseHabit, Periodicity, create_habit
-from src.storage.db import DatabaseHandler, PROD_DB_PATH
+# src/managers/habit_manager.py
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+
+# Import from other packages within src
+from src.storage.db import DatabaseHandler, Periodicity
+from src.data_model.completion import Completion
+from src.data_model.habit import BaseHabit, DailyHabit, WeeklyHabit, HabitFactory
 
 
 class HabitManager:
-    def __init__(self, db_path: str = None):
-        # Use production DB by default
-        if db_path is None:
-            self.db_path = PROD_DB_PATH
-        else:
-            self.db_path = db_path
+    """Manages habit operations and business logic"""
 
-        self.db = DatabaseHandler(self.db_path)
-        self.habits: List[BaseHabit] = []
-        self.load_habits()
+    def __init__(self, db_path: str = "habits.db"):
+        """
+        Initialize HabitManager with database connection
 
-    def load_habits(self):
-        """Load habits from database"""
-        db_habits = self.db.get_all_habits()
-        for habit_data in db_habits:
-            periodicity_enum = Periodicity(habit_data['periodicity'])
-            habit = create_habit(habit_data['name'], periodicity_enum, habit_data['created_at'])
+        Args:
+            db_path: Path to SQLite database file
+        """
+        self.db_handler = DatabaseHandler(db_path)
+        self.current_user_id = None
 
-            # Load completions
-            completions_data = self.db.get_completions_for_habit(habit_data['habit_id'])
-            for comp_data in completions_data:
-                # Create completion record
-                completion = habit.check_off(
-                    notes=comp_data['notes'],
-                    mood_score=comp_data['mood_score']
-                )
-                # Set the actual timestamp from database
-                completion.timestamp = comp_data['timestamp']
-
-            self.habits.append(habit)
+    def set_current_user(self, user_id: int):
+        """Set the current user for all operations"""
+        self.current_user_id = user_id
 
     def create_habit(self, name: str, periodicity: Periodicity) -> BaseHabit:
-        """Create a new habit and save to database"""
-        # Create in-memory habit object
-        habit = create_habit(name, periodicity)
+        """
+        Create a new habit for the current user
+
+        Args:
+            name: Name of the habit
+            periodicity: Periodicity (DAILY or WEEKLY)
+
+        Returns:
+            Created habit object
+
+        Raises:
+            ValueError: If no user is logged in or habit name is empty
+        """
+        if not self.current_user_id:
+            raise ValueError("No user logged in. Please login first.")
+
+        if not name or not name.strip():
+            raise ValueError("Habit name cannot be empty")
 
         # Save to database
-        habit_id = self.db.save_habit(name, periodicity.value)
+        habit_id = self.db_handler.save_habit(self.current_user_id, name.strip(), periodicity)
 
-        # Add to managed habits
-        self.habits.append(habit)
+        # Create habit object
+        created_date = datetime.now()
+        if periodicity == Periodicity.DAILY:
+            return DailyHabit(habit_id, name, created_date)
+        else:
+            return WeeklyHabit(habit_id, name, created_date)
 
-        return habit
+    def get_all_habits(self, active_only: bool = True) -> List[BaseHabit]:
+        """
+        Get all habits for the current user
 
-    def check_off_habit(self, habit_name: str, notes: str = "", mood_score: int = None) -> bool:
-        """Check off a habit as completed"""
-        habit = self.get_habit_by_name(habit_name)
+        Args:
+            active_only: If True, only return active habits
+
+        Returns:
+            List of habit objects
+        """
+        if not self.current_user_id:
+            raise ValueError("No user logged in")
+
+        habits_data = self.db_handler.get_habits_for_user(self.current_user_id, active_only)
+        habits = []
+
+        for habit_data in habits_data:
+            # Load completions for this habit
+            completions = self.db_handler.get_completions_for_habit(habit_data['habit_id'])
+            # Create habit object
+            habit = HabitFactory.create_habit_from_db(habit_data, completions)
+            habits.append(habit)
+
+        return habits
+
+    def get_habit_by_id(self, habit_id: int) -> Optional[BaseHabit]:
+        """
+        Get a specific habit by ID
+
+        Args:
+            habit_id: ID of the habit to retrieve
+
+        Returns:
+            Habit object if found, None otherwise
+        """
+        habit_data = self.db_handler.get_habit_by_id(habit_id)
+        if not habit_data:
+            return None
+
+        # Verify the habit belongs to current user
+        if habit_data['user_id'] != self.current_user_id:
+            return None
+
+        completions = self.db_handler.get_completions_for_habit(habit_id)
+        return HabitFactory.create_habit_from_db(habit_data, completions)
+
+    def delete_habit(self, habit_id: int) -> bool:
+        """
+        Soft delete a habit (set is_active to False)
+
+        Args:
+            habit_id: ID of the habit to delete
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Verify the habit belongs to current user
+        habit = self.get_habit_by_id(habit_id)
         if not habit:
+            return False
+
+        return self.db_handler.delete_habit(habit_id)
+
+    def check_off_habit(self, habit_id: int, notes: str = None, mood_score: int = None) -> bool:
+        """
+        Check off a habit (create completion record)
+
+        Args:
+            habit_id: ID of the habit to check off
+            notes: Optional notes about the completion
+            mood_score: Optional mood score (1-10)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        habit = self.get_habit_by_id(habit_id)
+        if not habit or not habit.is_active:
+            return False
+
+        # Check if habit is due
+        if not habit.is_due_on(datetime.now()):
             return False
 
         # Create completion
         completion = habit.check_off(notes, mood_score)
 
         # Save to database
-        self.db.save_completion(
-            habit_id=self._get_habit_id(habit_name),
-            timestamp=completion.timestamp,
-            notes=notes,
-            mood_score=mood_score
-        )
-
-        return True
-
-    def _get_habit_id(self, habit_name: str) -> Optional[int]:
-        """Get database ID for a habit by name"""
-        db_habits = self.db.get_all_habits()
-        for habit_data in db_habits:
-            if habit_data['name'] == habit_name:
-                return habit_data['habit_id']
-        return None
-
-    def get_habit_by_name(self, name: str) -> Optional[BaseHabit]:
-        """Get a habit by its name"""
-        for habit in self.habits:
-            if habit.name == name:
-                return habit
-        return None
-
-    def get_all_habits(self) -> List[BaseHabit]:
-        """Get all managed habits"""
-        return self.habits
-
-    def get_habits_by_periodicity(self, periodicity: Periodicity) -> List[BaseHabit]:
-        """Get habits filtered by periodicity"""
-        return [habit for habit in self.habits if habit.periodicity == periodicity]
-
-    def get_daily_habits(self) -> List[BaseHabit]:
-        """Get all daily habits"""
-        return self.get_habits_by_periodicity(Periodicity.DAILY)
-
-    def get_weekly_habits(self) -> List[BaseHabit]:
-        """Get all weekly habits"""
-        return self.get_habits_by_periodicity(Periodicity.WEEKLY)
-
-    def deactivate_habit(self, habit_name: str) -> bool:
-        """Deactivate a habit"""
-        habit = self.get_habit_by_name(habit_name)
-        if habit:
-            habit.deactivate()
-            habit_id = self._get_habit_id(habit_name)
-            if habit_id:
-                self.db.deactivate_habit(habit_id)
+        try:
+            self.db_handler.save_completion(habit_id, completion)
             return True
-        return False
+        except Exception as e:
+            print(f"Error saving completion: {e}")
+            return False
+
+    def get_habit_completions(self, habit_id: int, limit: int = None) -> List[Completion]:
+        """
+        Get completion records for a specific habit
+
+        Args:
+            habit_id: ID of the habit
+            limit: Optional limit on number of completions to return
+
+        Returns:
+            List of completion records
+        """
+        return self.db_handler.get_completions_for_habit(habit_id, limit)
+
+    def get_user_completions(self, days: int = None) -> List[dict]:
+        """
+        Get all completions for the current user
+
+        Args:
+            days: Optional number of days to look back
+
+        Returns:
+            List of completion records with habit information
+        """
+        if not self.current_user_id:
+            return []
+
+        return self.db_handler.get_completions_for_user(self.current_user_id, days)
